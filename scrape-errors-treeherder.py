@@ -14,6 +14,11 @@ def fetch_json(url):
     response.raise_for_status()
     return response.json()
 
+def fetch_log(url):
+    response = requests.get(url, headers=DEFAULT_REQUEST_HEADERS, timeout=30)
+    response.raise_for_status()
+    return response.text
+
 def getResultSetID(branch, revision):
     url = "https://treeherder.mozilla.org/api/project/%s/resultset/" \
           "?format=json&full=true&revision=%s" % (branch, revision)
@@ -26,6 +31,7 @@ def getCSetResults(branch, revision):
     up to 12 hours (usually < 4 hours)
     """
     rs_data = getResultSetID(branch, revision)
+    # this picks the topmost commit (commit message is the try syntax)
     results_set_id = rs_data['results'][0]['id']
 
     done = False
@@ -50,16 +56,47 @@ def getCSetResults(branch, revision):
 
     return retVal
 
-REVISION = 'a8774a1bf36810bb338ff2382e2b400a452bfca2'
+REVISION = '6087d958cb9622726c7c0ca605520ecfdd4b8701'
 csetresults = getCSetResults('try', REVISION)
 results = csetresults['results']
 
+# this is where we collect results
+affected_groups = {}
+
+
+retry_urls = []
+
 for r in results:
+    # looping through results for all jobs that ran for this push.
     # get bug suggestions: https://treeherder.mozilla.org/api/project/try/jobs/82734186/bug_suggestions/
-    url = 'https://treeherder.mozilla.org/api/project/try/jobs/%s/bug_suggestions/' % r['id']
-    data = fetch_json(url)
-    previous_search_terms = ''
-    for line in data:
-        if line['search_terms'] != previous_search_terms:
-            print line['search']
-        previous_search_terms = line['search_terms']
+    jobinfo_url = 'https://treeherder.mozilla.org/api/project/try/jobs/%s/' % r['id']
+    jobinfo = fetch_json(jobinfo_url)
+    if jobinfo['state'] != "completed":
+        #retry_urls.append(jobinfo_url)
+        #continue
+        raise SystemExit("[!] This try run is not finished, go away you fool.")
+    for logentry in jobinfo['logs']:
+        # logs array contains full log 'builds-4h' and 'errorsummary_json'.
+        # error summary does not (yet!) reliably contain all errors, so picking full log
+        if logentry['name'] != 'errorsummary_json':
+            # this is the full log.
+            logurl = logentry['url']
+            logtext = fetch_log(logurl)
+            errorcount = 0
+            for line in logtext.split("\n"):
+                if "DataUriUsageTracking" in line:
+                    errorcount += 1
+            if errorcount > 0:
+
+                if jobinfo['job_group_symbol'] in affected_groups:
+                    # add to list
+                    affected_groups[ jobinfo['job_group_symbol'] ][ jobinfo['job_type_symbol'] ] = errorcount
+                else:
+                    # create empty list
+                    affected_groups[ jobinfo['job_group_symbol'] ] = { jobinfo['job_type_symbol'] : errorcount }
+                print "Group {}, type {} has {} errors".format(jobinfo['job_group_symbol'], jobinfo['job_type_symbol'], affected_groups[ jobinfo['job_group_symbol'] ][ jobinfo['job_type_symbol'] ])
+
+print "Dumping into 'result.json'"
+import json
+json.dump(affected_groups, file("result.json", "w"))
+print "Done"
